@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import json
+import importlib
 import os
 import unittest
 from dataclasses import asdict
@@ -19,6 +20,7 @@ from mlx.utils import tree_flatten
 MODEL_NAME = "tiny"
 MLX_FP32_MODEL_PATH = "mlx_models/tiny_fp32"
 MLX_FP16_MODEL_PATH = "mlx_models/tiny_fp16"
+MLX_BF16_MODEL_PATH = "preloaded/tiny_bf16"
 MLX_4BITS_MODEL_PATH = "mlx_models/tiny_quantized_4bits"
 TEST_AUDIO = "mlx_whisper/assets/ls_test.flac"
 
@@ -51,13 +53,15 @@ def load_torch_and_mlx():
     weights = dict(tree_flatten(fp16_model.parameters()))
     _save_model(MLX_FP16_MODEL_PATH, weights, config)
 
+    bf16_model = convert(MODEL_NAME, dtype=mx.bfloat16)
+
     args = type("", (), {})()
     args.q_group_size = 64
     args.q_bits = 4
     weights, config = quantize(weights, config, args)
     _save_model(MLX_4BITS_MODEL_PATH, weights, config)
 
-    return torch_model, fp32_model, fp16_model
+    return torch_model, fp32_model, fp16_model, bf16_model
 
 
 def forward_torch(model, mels, tokens):
@@ -78,7 +82,7 @@ def forward_mlx(model, mels, tokens):
 class TestWhisper(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        _, cls.model, _ = load_torch_and_mlx()
+        _, cls.model, _, cls.bf16_model = load_torch_and_mlx()
         data = audio.load_audio(TEST_AUDIO)
         data = audio.pad_or_trim(data)
         cls.mels = audio.log_mel_spectrogram(data)
@@ -105,6 +109,22 @@ class TestWhisper(unittest.TestCase):
         tokens = mx.array(np.random.randint(0, dims.n_vocab, (1, 20)), mx.int32)
         logits = mlx_model(mels, tokens)
         self.assertEqual(logits.dtype, mx.float16)
+
+    def test_preloaded_bfloat16_transcribe(self):
+        transcribe_module = importlib.import_module("mlx_whisper.transcribe")
+        transcribe_module.ModelHolder.model = self.bf16_model
+        transcribe_module.ModelHolder.model_path = MLX_BF16_MODEL_PATH
+        result = transcribe_module.transcribe(
+            TEST_AUDIO,
+            path_or_hf_repo=MLX_BF16_MODEL_PATH,
+        )
+        self.assertEqual(
+            result["text"],
+            (
+                " Then the good soul openly sorted the boat and she "
+                "had buoyed so long in secret and bravely stretched on alone."
+            ),
+        )
 
     def test_quantized_4bits(self):
         mlx_model = load_models.load_model(MLX_4BITS_MODEL_PATH, mx.float16)

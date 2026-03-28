@@ -542,8 +542,11 @@ class DecodingTask:
         return tuple(sorted(set(suppress_tokens)))
 
     def _get_audio_features(self, mel: mx.array):
+        expected_dtype = (
+            self.model.dtype if self.options.fp16 else mx.float32
+        )
         if self.options.fp16:
-            mel = mel.astype(mx.float16)
+            mel = mel.astype(expected_dtype)
 
         if mel.shape[-2:] == (
             self.model.dims.n_audio_ctx,
@@ -554,10 +557,8 @@ class DecodingTask:
         else:
             audio_features = self.model.encoder(mel)
 
-        if audio_features.dtype != (mx.float16 if self.options.fp16 else mx.float32):
-            raise TypeError(
-                f"audio_features has an incorrect dtype: {audio_features.dtype}"
-            )
+        if audio_features.dtype != expected_dtype:
+            audio_features = audio_features.astype(expected_dtype)
 
         return audio_features
 

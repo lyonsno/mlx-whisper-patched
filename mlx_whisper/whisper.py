@@ -255,6 +255,10 @@ class Whisper(nn.Module):
         return self.decoder(tokens, self.encoder(mel))[0]
 
     @property
+    def dtype(self):
+        return self.encoder.conv1.weight.dtype
+
+    @property
     def is_multilingual(self):
         return self.dims.n_vocab >= 51865
 

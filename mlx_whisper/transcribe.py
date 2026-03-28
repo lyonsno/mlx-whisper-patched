@@ -59,6 +59,12 @@ class ModelHolder:
         return cls.model
 
 
+def _decode_dtype(model, decode_options) -> mx.Dtype:
+    if decode_options.get("fp16", True):
+        return getattr(model, "dtype", mx.float16)
+    return mx.float32
+
+
 def transcribe(
     audio: Union[str, np.ndarray, mx.array],
     *,
@@ -143,8 +149,9 @@ def transcribe(
     the spoken language ("language"), which is detected when `decode_options["language"]` is None.
     """
 
-    dtype = mx.float16 if decode_options.get("fp16", True) else mx.float32
-    model = ModelHolder.get_model(path_or_hf_repo, dtype)
+    requested_dtype = mx.float16 if decode_options.get("fp16", True) else mx.float32
+    model = ModelHolder.get_model(path_or_hf_repo, requested_dtype)
+    dtype = _decode_dtype(model, decode_options)
 
     # Pad 30-seconds of silence to the input audio, for slicing
     mel = log_mel_spectrogram(audio, n_mels=model.dims.n_mels, padding=N_SAMPLES)
