@@ -558,7 +558,15 @@ class DecodingTask:
             audio_features = self.model.encoder(mel)
 
         if audio_features.dtype != expected_dtype:
-            audio_features = audio_features.astype(expected_dtype)
+            if (
+                audio_features.dtype == mx.float32
+                and expected_dtype in (mx.float16, mx.bfloat16)
+            ):
+                audio_features = audio_features.astype(expected_dtype)
+            else:
+                raise TypeError(
+                    f"audio_features has an incorrect dtype: {audio_features.dtype}"
+                )
 
         return audio_features
 

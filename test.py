@@ -6,6 +6,7 @@ import os
 import unittest
 from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import patch
 
 import mlx.core as mx
 import mlx_whisper
@@ -114,9 +115,11 @@ class TestWhisper(unittest.TestCase):
         transcribe_module = importlib.import_module("mlx_whisper.transcribe")
         transcribe_module.ModelHolder.model = self.bf16_model
         transcribe_module.ModelHolder.model_path = MLX_BF16_MODEL_PATH
+        transcribe_module.ModelHolder.model_dtype = mx.bfloat16
         result = transcribe_module.transcribe(
             TEST_AUDIO,
             path_or_hf_repo=MLX_BF16_MODEL_PATH,
+            model_dtype=mx.bfloat16,
         )
         self.assertEqual(
             result["text"],
@@ -125,6 +128,30 @@ class TestWhisper(unittest.TestCase):
                 "had buoyed so long in secret and bravely stretched on alone."
             ),
         )
+
+    def test_model_holder_cache_keys_on_dtype(self):
+        transcribe_module = importlib.import_module("mlx_whisper.transcribe")
+        transcribe_module.ModelHolder.model = None
+        transcribe_module.ModelHolder.model_path = None
+        transcribe_module.ModelHolder.model_dtype = None
+
+        with patch.object(transcribe_module, "load_model") as mock_load_model:
+            mock_load_model.side_effect = ["fp32-model", "fp16-model", "bf16-model"]
+
+            self.assertEqual(
+                transcribe_module.ModelHolder.get_model("same-path", mx.float32),
+                "fp32-model",
+            )
+            self.assertEqual(
+                transcribe_module.ModelHolder.get_model("same-path", mx.float16),
+                "fp16-model",
+            )
+            self.assertEqual(
+                transcribe_module.ModelHolder.get_model("same-path", mx.bfloat16),
+                "bf16-model",
+            )
+
+        self.assertEqual(mock_load_model.call_count, 3)
 
     def test_quantized_4bits(self):
         mlx_model = load_models.load_model(MLX_4BITS_MODEL_PATH, mx.float16)
