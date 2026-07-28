@@ -4,7 +4,7 @@ import logging
 import time
 import zlib
 from dataclasses import dataclass, field, replace
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
 import numpy as np
@@ -12,6 +12,73 @@ from mlx.utils import tree_map
 
 from .audio import CHUNK_LENGTH
 from .tokenizer import Tokenizer, get_tokenizer
+
+
+class DecodeTimeoutError(TimeoutError):
+    """Terminal cooperative timeout for one transcription utterance."""
+
+    def __init__(
+        self,
+        *,
+        timeout: Optional[float],
+        phase: str,
+        window_index: Optional[int] = None,
+        temperature: Optional[float] = None,
+        token_count: Optional[int] = None,
+    ) -> None:
+        self.timeout = timeout
+        self.phase = phase
+        self.window_index = window_index
+        self.temperature = temperature
+        self.token_count = token_count
+        self.partial_result = False
+        timeout_text = "configured deadline" if timeout is None else f"{timeout:.3f}s"
+        detail = [f"decode deadline ({timeout_text}) exceeded during {phase}"]
+        if window_index is not None:
+            detail.append(f"window={window_index}")
+        if temperature is not None:
+            detail.append(f"temperature={temperature}")
+        if token_count is not None:
+            detail.append(f"tokens={token_count}")
+        super().__init__(", ".join(detail))
+
+
+def _check_decode_deadline(
+    *,
+    deadline: Optional[float],
+    now: Optional[float] = None,
+    timeout: Optional[float],
+    phase: str,
+    window_index: Optional[int] = None,
+    temperature: Optional[float] = None,
+    token_count: Optional[int] = None,
+) -> None:
+    if deadline is None:
+        return
+    effective_now = time.monotonic() if now is None else now
+    if effective_now <= deadline:
+        return
+    raise DecodeTimeoutError(
+        timeout=timeout,
+        phase=phase,
+        window_index=window_index,
+        temperature=temperature,
+        token_count=token_count,
+    )
+
+
+def _emit_telemetry(
+    callback: Optional[Callable[[dict], None]],
+    event: dict,
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(event)
+    except Exception:
+        logging.getLogger("mlx_whisper").exception(
+            "Decode telemetry callback failed for %s", event.get("event")
+        )
 
 
 def compression_ratio(text) -> float:
@@ -117,15 +184,22 @@ class DecodingOptions:
     # implementation details
     fp16: bool = True  # use fp16 for most of the calculation
 
-    # safety: cooperative wall-clock timeout for decoding a single segment
-    # (seconds). None preserves the original async scheduling. When set, the
-    # deadline is checked after the initial decode step and between later
-    # decode steps; if exceeded, decoding stops and returns the partial result.
+    # Cooperative wall-clock timeout. The top-level transcribe() call binds
+    # this duration to one absolute deadline shared by every audio window and
+    # temperature fallback. Direct decode() callers retain per-call behavior.
     decode_timeout: Optional[float] = None
+
+    # Absolute monotonic deadline supplied by transcribe(). This is separate
+    # from decode_timeout so every DecodingTask receives the same budget.
+    decode_deadline: Optional[float] = None
 
     # If True, eagerly wait for the completion signal each decode step instead
     # of relying on fully async evaluation.
     eager_eval: bool = False
+
+    # Optional structured phase evidence for callers that persist route reports.
+    telemetry_callback: Optional[Callable[[dict], None]] = None
+    window_index: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -582,14 +656,36 @@ class DecodingTask:
         return languages, lang_probs
 
     def _main_loop(self, audio_features: mx.array, tokens: mx.array):
-        logger = logging.getLogger("mlx_whisper")
         n_batch = tokens.shape[0]
         sum_logprobs = mx.zeros(n_batch)
-        deadline = (
-            time.monotonic() + self.options.decode_timeout
-            if self.options.decode_timeout is not None
-            else None
-        )
+        deadline = self.options.decode_deadline
+        if deadline is None and self.options.decode_timeout is not None:
+            deadline = time.monotonic() + self.options.decode_timeout
+
+        def check_deadline(phase: str, token_count: int) -> None:
+            try:
+                _check_decode_deadline(
+                    deadline=deadline,
+                    timeout=self.options.decode_timeout,
+                    phase=phase,
+                    window_index=self.options.window_index,
+                    temperature=self.options.temperature,
+                    token_count=token_count,
+                )
+            except DecodeTimeoutError as exc:
+                _emit_telemetry(
+                    self.options.telemetry_callback,
+                    {
+                        "event": "deadline_exceeded",
+                        "phase": exc.phase,
+                        "window_index": exc.window_index,
+                        "temperature": exc.temperature,
+                        "token_count": exc.token_count,
+                        "timeout_seconds": exc.timeout,
+                        "partial_result": False,
+                    },
+                )
+                raise
 
         def _step(inputs, audio_features, tokens, sum_logprobs):
             pre_logits = self.inference.logits(inputs, audio_features)
@@ -619,24 +715,12 @@ class DecodingTask:
             mx.eval(completed, tokens, sum_logprobs, no_speech_probs)
             if completed:
                 return tokens, sum_logprobs, no_speech_probs
-            if deadline is not None and time.monotonic() > deadline:
-                logger.warning(
-                    "Decode timeout (%.1fs) exceeded after the initial decode step",
-                    self.options.decode_timeout,
-                )
-                return tokens, sum_logprobs, no_speech_probs
+            check_deadline("decoder_initial_step", 1)
         else:
             mx.async_eval(completed, tokens, sum_logprobs, no_speech_probs)
 
         for i in range(1, self.sample_len):
-            if deadline is not None and time.monotonic() > deadline:
-                logger.warning(
-                    "Decode timeout (%.1fs) exceeded at iteration %d/%d",
-                    self.options.decode_timeout,
-                    i,
-                    self.sample_len,
-                )
-                break
+            check_deadline("decoder_before_step", i)
 
             inputs = tokens[:, -1:]
             if tokens.shape[-1] > self.n_ctx:
@@ -652,14 +736,7 @@ class DecodingTask:
                 sum_logprobs = next_sum_logprobs
                 if completed:
                     break
-                if deadline is not None and time.monotonic() > deadline:
-                    logger.warning(
-                        "Decode timeout (%.1fs) exceeded after iteration %d/%d",
-                        self.options.decode_timeout,
-                        i,
-                        self.sample_len,
-                    )
-                    break
+                check_deadline("decoder_after_step", i + 1)
             elif self.options.eager_eval:
                 mx.eval(next_completed)
                 mx.async_eval(next_tokens, next_sum_logprobs)
@@ -684,7 +761,49 @@ class DecodingTask:
         tokenizer: Tokenizer = self.tokenizer
         n_audio: int = mel.shape[0]
 
+        encoder_started = time.monotonic()
         audio_features: mx.array = self._get_audio_features(mel)  # encoder forward pass
+        if (
+            self.options.decode_deadline is not None
+            or self.options.decode_timeout is not None
+            or self.options.telemetry_callback is not None
+        ):
+            mx.eval(audio_features)
+        encoder_seconds = time.monotonic() - encoder_started
+        _emit_telemetry(
+            self.options.telemetry_callback,
+            {
+                "event": "encoder_complete",
+                "window_index": self.options.window_index,
+                "temperature": self.options.temperature,
+                "elapsed_seconds": encoder_seconds,
+            },
+        )
+        deadline = self.options.decode_deadline
+        if deadline is not None:
+            try:
+                _check_decode_deadline(
+                    deadline=deadline,
+                    timeout=self.options.decode_timeout,
+                    phase="encoder",
+                    window_index=self.options.window_index,
+                    temperature=self.options.temperature,
+                    token_count=0,
+                )
+            except DecodeTimeoutError as exc:
+                _emit_telemetry(
+                    self.options.telemetry_callback,
+                    {
+                        "event": "deadline_exceeded",
+                        "phase": exc.phase,
+                        "window_index": exc.window_index,
+                        "temperature": exc.temperature,
+                        "token_count": exc.token_count,
+                        "timeout_seconds": exc.timeout,
+                        "partial_result": False,
+                    },
+                )
+                raise
         tokens: mx.array = mx.array(self.initial_tokens)
         tokens = mx.broadcast_to(tokens, (n_audio, len(self.initial_tokens)))
 
@@ -710,6 +829,15 @@ class DecodingTask:
 
         # call the main sampling loop
         tokens, sum_logprobs, no_speech_probs = self._main_loop(audio_features, tokens)
+        _emit_telemetry(
+            self.options.telemetry_callback,
+            {
+                "event": "decoder_complete",
+                "window_index": self.options.window_index,
+                "temperature": self.options.temperature,
+                "token_count": int(tokens.shape[-1] - self.sample_begin),
+            },
+        )
 
         # reshape the tensors to have (n_audio, n_group) as the first two dimensions
         audio_features = audio_features[:: self.n_group]

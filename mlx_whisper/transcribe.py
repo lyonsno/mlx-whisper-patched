@@ -1,8 +1,9 @@
 # Copyright © 2023 Apple Inc.
 
 import sys
+import time
 import warnings
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import numpy as np
@@ -17,7 +18,13 @@ from .audio import (
     log_mel_spectrogram,
     pad_or_trim,
 )
-from .decoding import DecodingOptions, DecodingResult
+from .decoding import (
+    DecodeTimeoutError,
+    DecodingOptions,
+    DecodingResult,
+    _check_decode_deadline,
+    _emit_telemetry,
+)
 from .load_models import load_model
 from .timing import add_word_timestamps
 from .tokenizer import LANGUAGES, get_tokenizer
@@ -75,6 +82,7 @@ def transcribe(
     append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
     clip_timestamps: Union[str, List[float]] = "0",
     hallucination_silence_threshold: Optional[float] = None,
+    telemetry_callback: Optional[Callable[[dict], None]] = None,
     **decode_options,
 ):
     """
@@ -150,6 +158,23 @@ def transcribe(
     mel = log_mel_spectrogram(audio, n_mels=model.dims.n_mels, padding=N_SAMPLES)
     content_frames = mel.shape[-2] - N_FRAMES
     content_duration = float(content_frames * HOP_LENGTH / SAMPLE_RATE)
+    decode_timeout = decode_options.get("decode_timeout")
+    utterance_deadline = decode_options.get("decode_deadline")
+    if utterance_deadline is None and decode_timeout is not None:
+        utterance_deadline = time.monotonic() + decode_timeout
+    decode_options["decode_deadline"] = utterance_deadline
+    decode_options["telemetry_callback"] = telemetry_callback
+    started_at = time.monotonic()
+    _emit_telemetry(
+        telemetry_callback,
+        {
+            "event": "transcription_start",
+            "model": path_or_hf_repo,
+            "content_duration_seconds": content_duration,
+            "timeout_seconds": decode_timeout,
+            "deadline": utterance_deadline,
+        },
+    )
 
     if verbose:
         system_encoding = sys.getdefaultencoding()
@@ -204,14 +229,27 @@ def transcribe(
     if word_timestamps and task == "translate":
         warnings.warn("Word-level timestamps on translations may not be reliable.")
 
-    def decode_with_fallback(segment: mx.array) -> DecodingResult:
+    def decode_with_fallback(
+        segment: mx.array,
+        *,
+        window_index: int,
+    ) -> DecodingResult:
         temperatures = (
             [temperature] if isinstance(temperature, (int, float)) else temperature
         )
         decode_result = None
 
         for t in temperatures:
+            _check_decode_deadline(
+                deadline=utterance_deadline,
+                timeout=decode_timeout,
+                phase="temperature_fallback",
+                window_index=window_index,
+                temperature=t,
+                token_count=0,
+            )
             kwargs = {**decode_options}
+            kwargs["window_index"] = window_index
             if t > 0:
                 # disable beam_size and patience when t > 0
                 kwargs.pop("beam_size", None)
@@ -221,24 +259,62 @@ def transcribe(
                 kwargs.pop("best_of", None)
 
             options = DecodingOptions(**kwargs, temperature=t)
+            attempt_started = time.monotonic()
+            _emit_telemetry(
+                telemetry_callback,
+                {
+                    "event": "decode_attempt_start",
+                    "window_index": window_index,
+                    "temperature": t,
+                },
+            )
             decode_result = model.decode(segment, options)
+            token_count = len(decode_result.tokens)
 
             needs_fallback = False
+            fallback_reasons = []
             if (
                 compression_ratio_threshold is not None
                 and decode_result.compression_ratio > compression_ratio_threshold
             ):
                 needs_fallback = True  # too repetitive
+                fallback_reasons.append("compression_ratio")
             if (
                 logprob_threshold is not None
                 and decode_result.avg_logprob < logprob_threshold
             ):
                 needs_fallback = True  # average log probability is too low
+                fallback_reasons.append("avg_logprob")
             if (
                 no_speech_threshold is not None
                 and decode_result.no_speech_prob > no_speech_threshold
             ):
                 needs_fallback = False  # silence
+                fallback_reasons = ["no_speech"]
+            _emit_telemetry(
+                telemetry_callback,
+                {
+                    "event": "decode_attempt_end",
+                    "window_index": window_index,
+                    "temperature": t,
+                    "elapsed_seconds": time.monotonic() - attempt_started,
+                    "token_count": token_count,
+                    "avg_logprob": decode_result.avg_logprob,
+                    "compression_ratio": decode_result.compression_ratio,
+                    "no_speech_prob": decode_result.no_speech_prob,
+                    "fallback_reason": (
+                        "+".join(fallback_reasons) if needs_fallback else None
+                    ),
+                },
+            )
+            _check_decode_deadline(
+                deadline=utterance_deadline,
+                timeout=decode_timeout,
+                phase="temperature_fallback",
+                window_index=window_index,
+                temperature=t,
+                token_count=token_count,
+            )
             if not needs_fallback:
                 break
 
@@ -282,8 +358,16 @@ def transcribe(
         total=content_frames, unit="frames", disable=verbose is not False
     ) as pbar:
         last_speech_timestamp = 0.0
+        window_index = 0
         for seek_clip_start, seek_clip_end in seek_clips:
             while seek < seek_clip_end:
+                _check_decode_deadline(
+                    deadline=utterance_deadline,
+                    timeout=decode_timeout,
+                    phase="window_start",
+                    window_index=window_index,
+                    token_count=0,
+                )
                 time_offset = float(seek * HOP_LENGTH / SAMPLE_RATE)
                 window_end_time = float((seek + N_FRAMES) * HOP_LENGTH / SAMPLE_RATE)
                 segment_size = min(
@@ -292,9 +376,37 @@ def transcribe(
                 mel_segment = mel[seek : seek + segment_size]
                 segment_duration = segment_size * HOP_LENGTH / SAMPLE_RATE
                 mel_segment = pad_or_trim(mel_segment, N_FRAMES, axis=-2).astype(dtype)
+                _emit_telemetry(
+                    telemetry_callback,
+                    {
+                        "event": "window_start",
+                        "window_index": window_index,
+                        "seek_frame": int(seek),
+                        "start_seconds": time_offset,
+                        "duration_seconds": segment_duration,
+                    },
+                )
 
                 decode_options["prompt"] = all_tokens[prompt_reset_since:]
-                result: DecodingResult = decode_with_fallback(mel_segment)
+                try:
+                    result: DecodingResult = decode_with_fallback(
+                        mel_segment,
+                        window_index=window_index,
+                    )
+                except DecodeTimeoutError as exc:
+                    _emit_telemetry(
+                        telemetry_callback,
+                        {
+                            "event": "deadline_exceeded",
+                            "phase": exc.phase,
+                            "window_index": exc.window_index,
+                            "temperature": exc.temperature,
+                            "token_count": exc.token_count,
+                            "timeout_seconds": exc.timeout,
+                            "partial_result": False,
+                        },
+                    )
+                    raise
 
                 tokens = np.array(result.tokens)
 
@@ -535,9 +647,30 @@ def transcribe(
 
                 # update progress bar
                 pbar.update(min(content_frames, seek) - previous_seek)
+                _emit_telemetry(
+                    telemetry_callback,
+                    {
+                        "event": "window_end",
+                        "window_index": window_index,
+                        "seek_frame": int(seek),
+                        "token_count": len(result.tokens),
+                    },
+                )
+                window_index += 1
 
-    return dict(
+    result = dict(
         text=tokenizer.decode(all_tokens[len(initial_prompt_tokens) :]),
         segments=all_segments,
         language=language,
     )
+    _emit_telemetry(
+        telemetry_callback,
+        {
+            "event": "transcription_complete",
+            "elapsed_seconds": time.monotonic() - started_at,
+            "window_count": window_index,
+            "segment_count": len(all_segments),
+            "token_count": len(all_tokens) - len(initial_prompt_tokens),
+        },
+    )
+    return result
